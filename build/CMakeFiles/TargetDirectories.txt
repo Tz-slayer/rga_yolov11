@@ -1,3 +1,0 @@
-/home/orangepi/tests/build/CMakeFiles/rebuild_cache.dir
-/home/orangepi/tests/build/CMakeFiles/edit_cache.dir
-/home/orangepi/tests/build/CMakeFiles/test.dir
