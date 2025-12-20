@@ -46,6 +46,38 @@ double timer_end(my_timer_t *timer)
 }
 
 /*-------------------------------------------
+          CPU占用率测量辅助函数
+-------------------------------------------*/
+long get_cpu_time()
+{
+    FILE *fp = fopen("/proc/self/stat", "r");
+    if (!fp)
+    {
+        return 0;
+    }
+
+    char buffer[1024];
+    if (!fgets(buffer, sizeof(buffer), fp))
+    {
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
+
+    // 解析第14和15字段：utime stime
+    char *token = strtok(buffer, " ");
+    for (int i = 1; i < 14; i++)
+    {
+        token = strtok(NULL, " ");
+    }
+    long utime = atol(token);
+    token = strtok(NULL, " ");
+    long stime = atol(token);
+
+    return utime + stime;
+}
+
+/*-------------------------------------------
           摄像头初始化和采集函数
 -------------------------------------------*/
 typedef struct
@@ -373,6 +405,8 @@ int main(int argc, char **argv)
     image_buffer_t src_image;
     my_timer_t timer;
     my_timer_t total_timer;  // 新增总定时器
+    long start_cpu_time;     // 新增CPU时间起始值
+    int frame_count = 100;
 
     // 初始化所有结构体
     memset(&rknn_app_ctx, 0, sizeof(rknn_app_ctx));
@@ -386,13 +420,14 @@ int main(int argc, char **argv)
 
     const char *model_path = "../model/yolo11n.rknn";
     const char *camera_device = "/dev/video0";
-    const int cam_width = 640;
-    const int cam_height = 480;
+    const int cam_width = 1280;
+    const int cam_height = 720;
 
     printf("\n========== 开始测试 ==========\n\n");
 
-    // 开始总定时器
+    // 开始总定时器和CPU时间记录
     timer_start(&total_timer);
+    start_cpu_time = get_cpu_time();
 
     // 1. 初始化后处理
     printf("1. 初始化后处理模块...\n");
@@ -400,7 +435,7 @@ int main(int argc, char **argv)
 
     // 2. 初始化YOLO11模型
     printf("2. 加载YOLO11模型: %s\n", model_path);
-    timer_start(&timer);
+    
     ret = init_yolo11_model(model_path, &rknn_app_ctx);
     if (ret != 0)
     {
@@ -421,19 +456,8 @@ int main(int argc, char **argv)
     camera_initialized = true;
     printf("\n");
 
-    // 4. 采集一帧数据
-    printf("4. 采集图像帧...\n");
-    ret = capture_frame(&camera, &readbuffer);
-    if (ret != 0)
-    {
-        printf("ERROR: 采集帧失败\n");
-        goto cleanup;
-    }
-    printf("   成功采集帧 index=%d, bytesused=%d, length=%d\n\n",
-           readbuffer.index, readbuffer.bytesused, readbuffer.length);
-
-    // 5. 分配目标缓冲区
-    printf("5. 分配RGB888缓冲区...\n");
+    // 4. 分配目标缓冲区 (移到循环外，只分配一次)
+    printf("4. 分配RGB888缓冲区...\n");
     src_image.width = cam_width;
     src_image.height = cam_height;
     src_image.format = IMAGE_FORMAT_RGB888;
@@ -467,204 +491,231 @@ int main(int argc, char **argv)
     printf("   内存分配成功\n\n");
 #endif
 
-    // 6. 格式转换: YUYV -> RGB888
-    printf("6. 格式转换 YUYV -> RGB888...\n");
+    // 5. 采集并处理 100 帧数据
+    printf("5. 采集图像帧...\n");
     timer_start(&timer);
 
-#ifdef USE_RGA
-    { // 添加作用域
-        printf("   使用RGA硬件加速\n");
-
-        rga_buffer_t src_img, dst_img;
-        rga_buffer_handle_t src_handle = 0, dst_handle = 0;
-        int src_format = RK_FORMAT_YUYV_422;
-        int dst_format = RK_FORMAT_RGB_888;
-
-        size_t src_buf_size = cam_width * cam_height * get_bpp_from_format(src_format);
-        size_t dst_buf_size = cam_width * cam_height * get_bpp_from_format(dst_format);
-
-        // 如果使用DMABUF模式，直接使用摄像头的DMA缓冲区
-        if (camera.use_dmabuf)
+    for (int frame_idx = 0; frame_idx < frame_count; frame_idx++)
+    {
+        ret = capture_frame(&camera, &readbuffer);
+        if (ret != 0)
         {
-            printf("   直接使用摄像头DMABUF (零拷贝源)\n");
-            src_handle = importbuffer_fd(camera.dma_fd[readbuffer.index], src_buf_size);
+            printf("ERROR: 采集帧 %d 失败\n", frame_idx);
+            goto cleanup;
         }
-        else
-        {
-            // MMAP模式需要分配临时DMA缓冲区并拷贝
-            int src_dma_fd;
-            char *src_dma_buf;
-            ret = dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, src_buf_size, &src_dma_fd, (void **)&src_dma_buf);
-            if (ret < 0)
+
+#ifdef USE_RGA
+        { // 添加作用域
+            // printf("   使用RGA硬件加速\n");
+
+            rga_buffer_t src_img, dst_img;
+            rga_buffer_handle_t src_handle = 0, dst_handle = 0;
+            int src_format = RK_FORMAT_YUYV_422;
+            int dst_format = RK_FORMAT_RGB_888;
+
+            size_t src_buf_size = cam_width * cam_height * get_bpp_from_format(src_format);
+            size_t dst_buf_size = cam_width * cam_height * get_bpp_from_format(dst_format);
+
+            // 如果使用DMABUF模式，直接使用摄像头的DMA缓冲区
+            if (camera.use_dmabuf)
             {
-                printf("ERROR: 分配源DMA缓冲区失败\n");
-                goto cleanup;
+                // printf("   直接使用摄像头DMABUF (零拷贝源)\n");
+                src_handle = importbuffer_fd(camera.dma_fd[readbuffer.index], src_buf_size);
+            }
+            else
+            {
+                // MMAP模式需要分配临时DMA缓冲区并拷贝
+                int src_dma_fd;
+                char *src_dma_buf;
+                ret = dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, src_buf_size, &src_dma_fd, (void **)&src_dma_buf);
+                if (ret < 0)
+                {
+                    printf("ERROR: 分配源DMA缓冲区失败\n");
+                    goto cleanup;
+                }
+
+                memcpy(src_dma_buf, camera.mptr[readbuffer.index], src_buf_size);
+                src_handle = importbuffer_fd(src_dma_fd, src_buf_size);
+                
+                if (src_handle == 0)
+                {
+                    printf("ERROR: RGA importbuffer_fd失败 (src)\n");
+                    dma_buf_free(src_buf_size, &src_dma_fd, src_dma_buf);
+                    goto cleanup;
+                }
             }
 
-            memcpy(src_dma_buf, camera.mptr[readbuffer.index], src_buf_size);
-            src_handle = importbuffer_fd(src_dma_fd, src_buf_size);
-            
             if (src_handle == 0)
             {
                 printf("ERROR: RGA importbuffer_fd失败 (src)\n");
-                dma_buf_free(src_buf_size, &src_dma_fd, src_dma_buf);
                 goto cleanup;
             }
-        }
-
-        if (src_handle == 0)
-        {
-            printf("ERROR: RGA importbuffer_fd失败 (src)\n");
-            goto cleanup;
-        }
 
 #ifdef ZERO_COPY
-        // 使用src_image的DMA缓冲区作为目标（零拷贝）
-        dst_handle = importbuffer_fd(rknn_app_ctx.img_dma_buf.dma_buf_fd, dst_buf_size);
-        if (dst_handle == 0)
-        {
-            printf("ERROR: RGA importbuffer_fd失败 (dst)\n");
-            releasebuffer_handle(src_handle);
-            goto cleanup;
-        }
+            // 使用src_image的DMA缓冲区作为目标（零拷贝）
+            dst_handle = importbuffer_fd(rknn_app_ctx.img_dma_buf.dma_buf_fd, dst_buf_size);
+            if (dst_handle == 0)
+            {
+                printf("ERROR: RGA importbuffer_fd失败 (dst)\n");
+                releasebuffer_handle(src_handle);
+                goto cleanup;
+            }
 #else
-        // 非ZERO_COPY下，仍需分配目标DMA缓冲区
-        int dst_dma_fd;
-        char *dst_dma_buf;
-        ret = dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, dst_buf_size, &dst_dma_fd, (void **)&dst_dma_buf);
-        if (ret < 0)
-        {
-            printf("ERROR: 分配目标DMA缓冲区失败\n");
-            releasebuffer_handle(src_handle);
-            goto cleanup;
-        }
-        dst_handle = importbuffer_fd(dst_dma_fd, dst_buf_size);
-        if (dst_handle == 0)
-        {
-            printf("ERROR: RGA importbuffer_fd失败 (dst)\n");
-            releasebuffer_handle(src_handle);
-            dma_buf_free(dst_buf_size, &dst_dma_fd, dst_dma_buf);
-            goto cleanup;
-        }
+            // 非ZERO_COPY下，仍需分配目标DMA缓冲区
+            int dst_dma_fd;
+            char *dst_dma_buf;
+            ret = dma_buf_alloc(DMA_HEAP_DMA32_UNCACHED_PATH, dst_buf_size, &dst_dma_fd, (void **)&dst_dma_buf);
+            if (ret < 0)
+            {
+                printf("ERROR: 分配目标DMA缓冲区失败\n");
+                releasebuffer_handle(src_handle);
+                goto cleanup;
+            }
+            dst_handle = importbuffer_fd(dst_dma_fd, dst_buf_size);
+            if (dst_handle == 0)
+            {
+                printf("ERROR: RGA importbuffer_fd失败 (dst)\n");
+                releasebuffer_handle(src_handle);
+                dma_buf_free(dst_buf_size, &dst_dma_fd, dst_dma_buf);
+                goto cleanup;
+            }
 #endif
 
-        // 封装为RGA图像结构
-        src_img = wrapbuffer_handle(src_handle, cam_width, cam_height, src_format);
-        dst_img = wrapbuffer_handle(dst_handle, cam_width, cam_height, dst_format);
+            // 封装为RGA图像结构
+            src_img = wrapbuffer_handle(src_handle, cam_width, cam_height, src_format);
+            dst_img = wrapbuffer_handle(dst_handle, cam_width, cam_height, dst_format);
 
-        // 检查参数
-        IM_STATUS status = imcheck(src_img, dst_img, {}, {});
-        if (IM_STATUS_NOERROR != status)
-        {
-            printf("ERROR: RGA imcheck失败! %s\n", imStrError(status));
-            releasebuffer_handle(src_handle);
-            releasebuffer_handle(dst_handle);
-            goto cleanup;
-        }
+            // 检查参数
+            IM_STATUS status = imcheck(src_img, dst_img, {}, {});
+            if (IM_STATUS_NOERROR != status)
+            {
+                printf("ERROR: RGA imcheck失败! %s\n", imStrError(status));
+                releasebuffer_handle(src_handle);
+                releasebuffer_handle(dst_handle);
+                goto cleanup;
+            }
 
-        // 执行颜色空间转换
-        status = imcvtcolor(src_img, dst_img, src_format, dst_format);
-        if (IM_STATUS_SUCCESS != status)
-        {
-            printf("ERROR: RGA imcvtcolor失败! %s\n", imStrError(status));
-            releasebuffer_handle(src_handle);
-            releasebuffer_handle(dst_handle);
-            goto cleanup;
-        }
+            // 执行颜色空间转换
+            status = imcvtcolor(src_img, dst_img, src_format, dst_format);
+            if (IM_STATUS_SUCCESS != status)
+            {
+                printf("ERROR: RGA imcvtcolor失败! %s\n", imStrError(status));
+                releasebuffer_handle(src_handle);
+                releasebuffer_handle(dst_handle);
+                goto cleanup;
+            }
 
 #ifndef ZERO_COPY
-        // 非ZERO_COPY下，将转换后的数据复制到src_image.virt_addr
-        memcpy(src_image.virt_addr, dst_dma_buf, dst_buf_size);
-        dma_buf_free(dst_buf_size, &dst_dma_fd, dst_dma_buf);
+            // 非ZERO_COPY下，将转换后的数据复制到src_image.virt_addr
+            memcpy(src_image.virt_addr, dst_dma_buf, dst_buf_size);
+            dma_buf_free(dst_buf_size, &dst_dma_fd, dst_dma_buf);
 #endif
 
-        // 释放RGA句柄
-        releasebuffer_handle(src_handle);
-        releasebuffer_handle(dst_handle);
+            // 释放RGA句柄
+            releasebuffer_handle(src_handle);
+            releasebuffer_handle(dst_handle);
 
-        printf("   RGA转换完成，耗时: %.2f ms\n\n", timer_end(&timer));
-    } // 结束作用域
+            // printf("   RGA转换完成，耗时: %.2f ms\n\n", timer_end(&timer));
+        } // 结束作用域
 #else
-    // 如果不使用 RGA 使用 opencv 进行转换
-    { // 添加作用域以避免goto跨越初始化
-        printf("   使用OpenCV转换\n");
-        cv::Mat yuyv_mat(cam_height, cam_width, CV_8UC2, camera.mptr[readbuffer.index]);
-        cv::Mat rgb_mat;
-        cv::cvtColor(yuyv_mat, rgb_mat, cv::COLOR_YUV2RGB_YUYV);
-        memcpy(src_image.virt_addr, rgb_mat.data, src_image.size);
-        printf("   OpenCV转换完成，耗时: %.2f ms\n\n", timer_end(&timer));
-    } // 结束作用域
+        // 如果不使用 RGA 使用 opencv 进行转换
+        { // 添加作用域以避免goto跨越初始化
+            // printf("   使用OpenCV转换\n");
+            cv::Mat yuyv_mat(cam_height, cam_width, CV_8UC2, camera.mptr[readbuffer.index]);
+            cv::Mat rgb_mat;
+            cv::cvtColor(yuyv_mat, rgb_mat, cv::COLOR_YUV2RGB_YUYV);
+            memcpy(src_image.virt_addr, rgb_mat.data, src_image.size);
+            // printf("   OpenCV转换完成，耗时: %.2f ms\n\n", timer_end(&timer));
+        } // 结束作用域
 #endif
 
 #ifdef ZERO_COPY
-    // 同步到设备
-    dma_sync_cpu_to_device(rknn_app_ctx.img_dma_buf.dma_buf_fd);
+        // 同步到设备
+        dma_sync_cpu_to_device(rknn_app_ctx.img_dma_buf.dma_buf_fd);
 #endif
+        // 放回缓冲区
+        release_frame(&camera, &readbuffer);
 
-    // 7. 执行YOLO推理
-    printf("7. 执行YOLO推理...\n");
-    timer_start(&timer);
+        // 7. 执行YOLO推理
+        printf("7. 执行YOLO推理...\n");
+        timer_start(&timer);
 
-    object_detect_result_list od_results;
-    ret = inference_yolo11_model(&rknn_app_ctx, &src_image, &od_results);
-    if (ret != 0)
-    {
-        printf("ERROR: 推理失败! ret=%d\n", ret);
-        goto cleanup;
+        // object_detect_result_list od_results;
+        // ret = inference_yolo11_model(&rknn_app_ctx, &src_image, &od_results);
+        // if (ret != 0)
+        // {
+        //     printf("ERROR: 推理失败! ret=%d\n", ret);
+        //     goto cleanup;
+        // }
+
+        // printf("   推理完成，耗时: %.2f ms\n\n", timer_end(&timer));
+
+        // 8. 处理检测结果 (可选：只在最后帧处理以节省时间)
+    //     if (frame_idx == 999)  // 只在最后一帧处理结果
+    //     {
+    //         // printf("8. 检测结果:\n");
+    //         // printf("   检测到 %d 个目标\n", od_results.count);
+
+    //         char text[256];
+    //         for (int i = 0; i < od_results.count; i++)
+    //         {
+    //             object_detect_result *det_result = &(od_results.results[i]);
+    //             // printf("   [%d] %s @ (%d,%d)-(%d,%d) 置信度: %.1f%%\n",
+    //             //        i + 1,
+    //             //        coco_cls_to_name(det_result->cls_id),
+    //             //        det_result->box.left, det_result->box.top,
+    //             //        det_result->box.right, det_result->box.bottom,
+    //             //        det_result->prop * 100);
+
+    //             int x1 = det_result->box.left;
+    //             int y1 = det_result->box.top;
+    //             int x2 = det_result->box.right;
+    //             int y2 = det_result->box.bottom;
+
+    //             // 绘制边界框
+    //             draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
+
+    //             // // 绘制标签
+    //             // snprintf(text, sizeof(text), "%s %.1f%%",
+    //             //          coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
+    //             // draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
+    //         }
+    //         // printf("\n");
+    //     }
+
+    //     if ((frame_idx + 1) % 100 == 0)  // 每100帧打印进度
+    //     {
+    //         printf("   已处理 %d 帧\n", frame_idx + 1);
+    //     }
     }
 
-    printf("   推理完成，耗时: %.2f ms\n\n", timer_end(&timer));
-
-    // 8. 处理检测结果
-    printf("8. 检测结果:\n");
-    printf("   检测到 %d 个目标\n", od_results.count);
-
-    char text[256];
-    for (int i = 0; i < od_results.count; i++)
-    {
-        object_detect_result *det_result = &(od_results.results[i]);
-        printf("   [%d] %s @ (%d,%d)-(%d,%d) 置信度: %.1f%%\n",
-               i + 1,
-               coco_cls_to_name(det_result->cls_id),
-               det_result->box.left, det_result->box.top,
-               det_result->box.right, det_result->box.bottom,
-               det_result->prop * 100);
-
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
-
-        // 绘制边界框
-        draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
-
-        // 绘制标签
-        snprintf(text, sizeof(text), "%s %.1f%%",
-                 coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-        draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
-    }
-    printf("\n");
+    // printf("   处理 1000 帧完成，耗时: %.2f ms (平均每帧: %.2f ms)\n\n", timer_end(&timer), timer_end(&timer) / 1000.0);
 
     // 9. 保存结果图像
-    printf("9. 保存结果图像...\n");
-    ret = write_image("out.png", &src_image);
-    if (ret == 0)
-    {
-        printf("   结果已保存到 out.png\n");
-    }
-    else
-    {
-        printf("WARNING: 保存图像失败\n");
-    }
-
-    // 放回缓冲区
-    release_frame(&camera, &readbuffer);
+    // printf("9. 保存结果图像...\n");
+    // ret = write_image("out.png", &src_image);
+    // if (ret == 0)
+    // {
+    //     printf("   结果已保存到 out.png\n");
+    // }
+    // else
+    // {
+    //     printf("WARNING: 保存图像失败\n");
+    // }
 
     printf("\n========== 测试完成 ==========\n\n");
 
 cleanup:
-    // 结束总定时器并打印总耗时
-    printf("总耗时: %.2f ms\n", timer_end(&total_timer));
+    // 结束总定时器并打印总耗时和CPU占用率
+    double total_time_ms = timer_end(&total_timer);
+    long end_cpu_time = get_cpu_time();
+    double wall_time_sec = total_time_ms / 1000.0;
+    long cpu_ticks = end_cpu_time - start_cpu_time;
+    int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    double cpu_usage = (cpu_ticks / (double)sysconf(_SC_CLK_TCK)) / wall_time_sec * 100.0 / num_cpus;
+
+    printf("总耗时: %.2f ms\n", total_time_ms);
+    printf("CPU占用率: %.2f%%\n", cpu_usage);
 
     // 清理资源
     printf("清理资源...\n");
